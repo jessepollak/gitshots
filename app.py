@@ -1,4 +1,5 @@
 import cStringIO
+import re
 from datetime import datetime
 from collections import defaultdict
 
@@ -13,8 +14,7 @@ from flask import (
 from flask.ext.pymongo import PyMongo
 from flask.ext.cache import Cache
 from bson.json_util import loads
-from bson import binary
-from bson.code import Code
+from bson import binary, ObjectId
 import Image
 
 
@@ -30,6 +30,16 @@ app.config.from_object('config')
 
 cache = Cache(app)
 mongo = PyMongo(app)
+
+_paragraph_re = re.compile(r'(?:\r\n|\r|\n){2,}')
+
+
+@app.template_filter()
+def commitmsg(value):
+    result = u'\n\n'.join(
+        u'<p>{}</p>'.format(p.replace('.\n', '.<br/>\n'))
+        for p in _paragraph_re.split(value))
+    return result
 
 
 @app.errorhandler(404)
@@ -68,7 +78,7 @@ def put_commit(gitshot_id):
     return str(mongo.db.gitshots.save(gitshot))
 
 
-@app.route('/img/<ObjectId:gitshot_id>.jpg')
+@app.route('/gitshot/<ObjectId:gitshot_id>.jpg')
 @cache.memoize(3600)  # cache for 1 hour
 def render_image(gitshot_id):
     def wsgi_app(environ, start_response):
@@ -86,7 +96,19 @@ def render_image(gitshot_id):
 
 @app.route('/user/<username>')
 def user_profile(username):
-    gitshots = mongo.db.gitshots.find({'author': username}, {'img': False})
+    limit = int(request.args.get('limit', 10))
+    sort = request.args.get('sort', 'ts')
+    projects = mongo.db.gitshots.find(
+        {'author': username}).distinct('project')
+    gitshots = []
+    for project in projects:
+        shots = mongo.db.gitshots.find(
+            {'author': username,
+             'project': project},
+            {'img': False}
+        ).limit(limit).sort(sort, -1)
+        gitshots.extend(shots)
+
     if request_wants_json():
         return jsonify(items=list(gitshots))
     ret = defaultdict(list)
@@ -97,7 +119,12 @@ def user_profile(username):
 
 @app.route('/project/<project>')
 def project(project):
-    gitshots = mongo.db.gitshots.find({'project': project}, {'img': False})
+    limit = int(request.args.get('limit', 100))
+    sort = request.args.get('sort', 'ts')
+    gitshots = mongo.db.gitshots.find(
+        {'project': project},
+        {'img': False}
+    ).limit(limit).sort(sort, -1)
     if request_wants_json():
         return jsonify(items=[list(gitshots)])
     ret = defaultdict(list)
@@ -106,15 +133,14 @@ def project(project):
     return render_template('project.html', gitshots=ret)
 
 
-fn = Code(
-    """
-        function(obj, prev) {
-            prev.documents.push(obj)
-        }
-    """
-)
+@app.route('/gitshot/<ObjectId:gitshot_id>.html')
+def gitshot(gitshot_id):
+    gitshot = mongo.db.gitshots.find_one(ObjectId(gitshot_id))
+    return render_template('commit.html', gitshot=gitshot)
+
 
 @app.route('/')
+@cache.memoize(300)  # cache for five minutes
 def index():
     projects, users = dict(), dict()
     project_names = mongo.db.gitshots.distinct('project')
